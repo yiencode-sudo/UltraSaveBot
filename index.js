@@ -15,6 +15,7 @@ import TelegramBot from "node-telegram-bot-api";
 // - YTDLP_PATH (default: ./yt-dlp.exe on Windows, otherwise yt-dlp in PATH)
 // - FFMPEG_LOCATION (directory containing ffmpeg/ffprobe)
 // - YTDLP_JS_RUNTIMES (default: node; used for YouTube extraction)
+// - YTDLP_PROXY (optional; e.g. http://user:pass@host:port)
 // - COOKIES_FROM_BROWSER (e.g. chrome, edge, firefox)
 dotenv.config({ quiet: true });
 
@@ -44,6 +45,7 @@ const FFMPEG_LOCATION = process.env.FFMPEG_LOCATION?.trim() ||
   "";
 
 const YTDLP_JS_RUNTIMES = process.env.YTDLP_JS_RUNTIMES?.trim() || "node";
+const YTDLP_PROXY = process.env.YTDLP_PROXY?.trim() || "";
 
 const COOKIES_FROM_BROWSER = process.env.COOKIES_FROM_BROWSER?.trim() ||
   process.env.YTDLP_COOKIES_FROM_BROWSER?.trim() ||
@@ -309,6 +311,10 @@ function buildYtDlpArgs({
     args.push("--js-runtimes", YTDLP_JS_RUNTIMES);
   }
 
+  if (YTDLP_PROXY) {
+    args.push("--proxy", YTDLP_PROXY);
+  }
+
   if (dumpJson) {
     args.push("--dump-single-json");
   } else {
@@ -400,7 +406,13 @@ async function runYtDlpInfo(url) {
     const first = text.indexOf("{");
     const last = text.lastIndexOf("}");
     if (first < 0 || last < 0 || last <= first) {
-      throw new Error("yt-dlp did not return JSON metadata.");
+      const snippet = text
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 500);
+      throw new Error(
+        `yt-dlp metadata parse failed. Output: ${snippet || "(empty output)"}`
+      );
     }
     return JSON.parse(text.slice(first, last + 1));
   };
@@ -430,6 +442,7 @@ async function runYtDlpInfo(url) {
 async function runYtDlpInfoWithFallback(url) {
   const candidates = buildYtDlpCandidateUrls(url);
   let lastError = null;
+  const failures = [];
 
   for (const candidateUrl of candidates) {
     try {
@@ -437,15 +450,22 @@ async function runYtDlpInfoWithFallback(url) {
       return { info, ytdlpUrl: candidateUrl };
     } catch (error) {
       lastError = error;
+      const reason = error?.message || String(error);
+      failures.push({ candidateUrl, reason });
       log(
         `[yt-dlp] Metadata attempt failed for ${candidateUrl}: ${
-          error?.message || String(error)
+          reason
         }`
       );
     }
   }
 
-  if (lastError) throw lastError;
+  if (lastError) {
+    const summary = failures
+      .map((item) => `${item.candidateUrl} => ${item.reason}`)
+      .join(" | ");
+    throw new Error(`yt-dlp failed for all candidate URLs. ${summary}`);
+  }
   throw new Error("yt-dlp metadata extraction failed for all candidate URLs.");
 }
 
@@ -764,6 +784,13 @@ function getFriendlyErrorMessage(errorText) {
     return "YouTube blocked this server IP. Try another link or use cookies/proxy.";
   }
 
+  if (
+    text.includes("unable to extract initial data") ||
+    text.includes("failed to extract any player response")
+  ) {
+    return "YouTube blocked extraction from this server. Try another region/IP (YTDLP_PROXY).";
+  }
+
   if (text.includes("no supported javascript runtime could be found")) {
     return "yt-dlp needs a JavaScript runtime for this YouTube link. Set YTDLP_JS_RUNTIMES=node.";
   }
@@ -1011,6 +1038,7 @@ bot.on("polling_error", (error) => {
   log(`[startup] YTDLP_PATH=${YTDLP_PATH}`);
   log(`[startup] FFMPEG_LOCATION=${FFMPEG_LOCATION || "(not set)"}`);
   log(`[startup] YTDLP_JS_RUNTIMES=${YTDLP_JS_RUNTIMES || "(not set)"}`);
+  log(`[startup] YTDLP_PROXY=${YTDLP_PROXY ? "(set)" : "(not set)"}`);
   log(`[startup] COOKIES_FROM_BROWSER=${COOKIES_FROM_BROWSER || "(not set)"}`);
   log(`[startup] MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB}`);
   log(`[startup] AUTO_DOWNLOAD=${AUTO_DOWNLOAD}`);
