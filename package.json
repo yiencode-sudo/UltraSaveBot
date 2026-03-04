@@ -1,0 +1,22 @@
+﻿{
+  "name": "telegram-video-downloader-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that resolves links and downloads videos with yt-dlp",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "yt-dlp",
+    "video-downloader"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.11.0",
+    "dotenv": "^17.3.1",
+    "node-telegram-bot-api": "^0.67.0"
+  }
+}
