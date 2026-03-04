@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: telegram-video-downloader-bot
+    runtime: docker
+    region: singapore
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_DOWNLOAD_MB
+        value: "200"
+      - key: AUTO_DOWNLOAD
+        value: "true"
