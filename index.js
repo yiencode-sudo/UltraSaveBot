@@ -107,6 +107,35 @@ function isYouTubeUrl(url) {
   return /(?:^|\/\/)(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
 }
 
+function extractYouTubeVideoId(url) {
+  const watchId = url.match(/[?&]v=([a-zA-Z0-9_-]{11})(?:[&#]|$)/)?.[1];
+  if (watchId) return watchId;
+
+  const shortsId = url.match(/\/shorts\/([a-zA-Z0-9_-]{11})(?:[/?&#]|$)/)?.[1];
+  if (shortsId) return shortsId;
+
+  const shortHostId = url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})(?:[/?&#]|$)/)?.[1];
+  if (shortHostId) return shortHostId;
+
+  return null;
+}
+
+function buildYtDlpCandidateUrls(url) {
+  const candidates = [url];
+  if (!isYouTubeUrl(url)) return candidates;
+
+  const videoId = extractYouTubeVideoId(url);
+  if (!videoId) return candidates;
+
+  candidates.push(
+    `https://www.youtube.com/watch?v=${videoId}`,
+    `https://www.youtube.com/shorts/${videoId}`,
+    `https://youtu.be/${videoId}`
+  );
+
+  return [...new Set(candidates)];
+}
+
 function decodeEscapedUrl(value) {
   return value
     .replace(/\\u002F/g, "/")
@@ -398,6 +427,28 @@ async function runYtDlpInfo(url) {
   }
 }
 
+async function runYtDlpInfoWithFallback(url) {
+  const candidates = buildYtDlpCandidateUrls(url);
+  let lastError = null;
+
+  for (const candidateUrl of candidates) {
+    try {
+      const info = await runYtDlpInfo(candidateUrl);
+      return { info, ytdlpUrl: candidateUrl };
+    } catch (error) {
+      lastError = error;
+      log(
+        `[yt-dlp] Metadata attempt failed for ${candidateUrl}: ${
+          error?.message || String(error)
+        }`
+      );
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error("yt-dlp metadata extraction failed for all candidate URLs.");
+}
+
 async function runYtDlpDownload(url, outputTemplate, formatSelector, downloadMode = "video") {
   const includeCookies = shouldUseCookies(url);
   const args = buildYtDlpArgs({
@@ -581,6 +632,8 @@ async function handleSelectionDownload(
       await bot.sendMessage(chatId, `Downloading ${choice.text}...`);
     }
 
+    const sourceUrl = selection.ytdlpUrl || selection.finalUrl;
+
     const baseName = `video_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
     const outputTemplate = path.join(DOWNLOAD_DIR, `${baseName}.%(ext)s`);
 
@@ -594,7 +647,7 @@ async function handleSelectionDownload(
       await downloadDirectFile(choice.directUrl, downloadedFilePath);
     } else if (choice.kind === "audio") {
       await runYtDlpDownload(
-        selection.finalUrl,
+        sourceUrl,
         outputTemplate,
         choice.formatSelector || "bestaudio/best",
         "audio"
@@ -607,7 +660,7 @@ async function handleSelectionDownload(
         ".aac",
       ]);
     } else {
-      await runYtDlpDownload(selection.finalUrl, outputTemplate, choice.formatSelector, "video");
+      await runYtDlpDownload(sourceUrl, outputTemplate, choice.formatSelector, "video");
       downloadedFilePath = await findDownloadedFile(baseName, [".mp4"]);
     }
 
@@ -762,9 +815,12 @@ bot.on("message", async (msg) => {
     let sourceType = "ytdlp";
     let choices = [];
     let previewImageUrl = null;
+    let ytdlpUrl = finalUrl;
 
     try {
-      const info = await runYtDlpInfo(finalUrl);
+      const metadata = await runYtDlpInfoWithFallback(finalUrl);
+      const info = metadata.info;
+      ytdlpUrl = metadata.ytdlpUrl;
       choices = buildFormatChoices(info);
       previewImageUrl = extractPreviewImageUrl(info);
 
@@ -821,6 +877,7 @@ bot.on("message", async (msg) => {
     pendingSelections.set(selectionId, {
       chatId,
       finalUrl,
+      ytdlpUrl: sourceType === "ytdlp" ? ytdlpUrl : finalUrl,
       sourceType,
       choices,
       hdChoiceIndex,
