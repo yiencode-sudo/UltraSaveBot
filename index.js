@@ -14,6 +14,7 @@ import TelegramBot from "node-telegram-bot-api";
 // Optional:
 // - YTDLP_PATH (default: ./yt-dlp.exe on Windows, otherwise yt-dlp in PATH)
 // - FFMPEG_LOCATION (directory containing ffmpeg/ffprobe)
+// - YTDLP_JS_RUNTIMES (default: node; used for YouTube extraction)
 // - COOKIES_FROM_BROWSER (e.g. chrome, edge, firefox)
 dotenv.config({ quiet: true });
 
@@ -41,6 +42,8 @@ const YTDLP_PATH = process.env.YTDLP_PATH?.trim() ||
 const FFMPEG_LOCATION = process.env.FFMPEG_LOCATION?.trim() ||
   process.env.YTDLP_FFMPEG_LOCATION?.trim() ||
   "";
+
+const YTDLP_JS_RUNTIMES = process.env.YTDLP_JS_RUNTIMES?.trim() || "node";
 
 const COOKIES_FROM_BROWSER = process.env.COOKIES_FROM_BROWSER?.trim() ||
   process.env.YTDLP_COOKIES_FROM_BROWSER?.trim() ||
@@ -98,6 +101,10 @@ function isKuaishouShortVideoUrl(url) {
 
 function isKuaishouUrl(url) {
   return /(?:^|\/\/)(?:v\.kuaishou\.com|(?:www\.)?kuaishou\.com)\//i.test(url);
+}
+
+function isYouTubeUrl(url) {
+  return /(?:^|\/\/)(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
 }
 
 function decodeEscapedUrl(value) {
@@ -268,6 +275,10 @@ function buildYtDlpArgs({
     "--no-warnings",
     "--newline",
   ];
+
+  if (YTDLP_JS_RUNTIMES && isYouTubeUrl(url)) {
+    args.push("--js-runtimes", YTDLP_JS_RUNTIMES);
+  }
 
   if (dumpJson) {
     args.push("--dump-single-json");
@@ -687,6 +698,23 @@ function getFriendlyErrorMessage(errorText) {
     return "FFmpeg is missing. Install FFmpeg and set FFMPEG_LOCATION in .env if needed.";
   }
 
+  if (
+    text.includes("video unavailable") ||
+    text.includes("private video") ||
+    text.includes("this video is private") ||
+    text.includes("this video is not available")
+  ) {
+    return "This video is unavailable, private, or region-restricted.";
+  }
+
+  if (text.includes("sign in to confirm you're not a bot")) {
+    return "YouTube blocked this server IP. Try another link or use cookies/proxy.";
+  }
+
+  if (text.includes("no supported javascript runtime could be found")) {
+    return "yt-dlp needs a JavaScript runtime for this YouTube link. Set YTDLP_JS_RUNTIMES=node.";
+  }
+
   if (text.includes("unable to extract") || text.includes("extractor")) {
     return "Platform extraction failed. Update yt-dlp and try again.";
   }
@@ -925,6 +953,7 @@ bot.on("polling_error", (error) => {
   log(`[startup] Bot started with polling.`);
   log(`[startup] YTDLP_PATH=${YTDLP_PATH}`);
   log(`[startup] FFMPEG_LOCATION=${FFMPEG_LOCATION || "(not set)"}`);
+  log(`[startup] YTDLP_JS_RUNTIMES=${YTDLP_JS_RUNTIMES || "(not set)"}`);
   log(`[startup] COOKIES_FROM_BROWSER=${COOKIES_FROM_BROWSER || "(not set)"}`);
   log(`[startup] MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB}`);
   log(`[startup] AUTO_DOWNLOAD=${AUTO_DOWNLOAD}`);
