@@ -142,14 +142,54 @@ function extractDouyinVideoId(url) {
 }
 
 function isYouTubeUrl(url) {
-  return /(?:^|\/\/)(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === "youtu.be" ||
+      host === "youtube.com" ||
+      host === "www.youtube.com" ||
+      host === "m.youtube.com" ||
+      host === "music.youtube.com" ||
+      host === "youtube-nocookie.com" ||
+      host === "www.youtube-nocookie.com"
+    );
+  } catch {
+    return /(?:^|\/\/)(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
+  }
 }
 
 function extractYouTubeVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+
+    if (host === "youtu.be") {
+      const pathId = parsed.pathname.split("/").filter(Boolean)[0];
+      return /^[a-zA-Z0-9_-]{11}$/.test(pathId || "") ? pathId : null;
+    }
+
+    const watchId = parsed.searchParams.get("v");
+    if (/^[a-zA-Z0-9_-]{11}$/.test(watchId || "")) {
+      return watchId;
+    }
+
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    const pathCandidate = pathParts.length >= 2 &&
+      ["shorts", "live", "embed", "watch"].includes(pathParts[0].toLowerCase())
+      ? pathParts[1]
+      : null;
+    if (/^[a-zA-Z0-9_-]{11}$/.test(pathCandidate || "")) {
+      return pathCandidate;
+    }
+  } catch {
+    // Fallback to regex parsing for malformed inputs.
+  }
+
   const watchId = url.match(/[?&]v=([a-zA-Z0-9_-]{11})(?:[&#]|$)/)?.[1];
   if (watchId) return watchId;
 
-  const shortsId = url.match(/\/shorts\/([a-zA-Z0-9_-]{11})(?:[/?&#]|$)/)?.[1];
+  const shortsId = url.match(/\/(?:shorts|live|embed)\/([a-zA-Z0-9_-]{11})(?:[/?&#]|$)/)?.[1];
   if (shortsId) return shortsId;
 
   const shortHostId = url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})(?:[/?&#]|$)/)?.[1];
@@ -165,13 +205,11 @@ function buildYtDlpCandidateUrls(url) {
   const videoId = extractYouTubeVideoId(url);
   if (!videoId) return candidates;
 
-  candidates.push(
+  return [
     `https://www.youtube.com/watch?v=${videoId}`,
     `https://www.youtube.com/shorts/${videoId}`,
     `https://youtu.be/${videoId}`
-  );
-
-  return [...new Set(candidates)];
+  ].concat(candidates).filter((value, index, values) => values.indexOf(value) === index);
 }
 
 function decodeEscapedUrl(value) {
