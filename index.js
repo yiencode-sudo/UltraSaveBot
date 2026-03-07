@@ -59,6 +59,14 @@ const RESOLVE_HEADERS = {
     "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 };
+const MOBILE_SHARE_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36",
+  Accept: RESOLVE_HEADERS.Accept,
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+  Referer: "https://www.douyin.com/",
+};
 
 // Initialize Telegram bot with polling.
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -105,6 +113,28 @@ function isKuaishouUrl(url) {
   return /(?:^|\/\/)(?:v\.kuaishou\.com|(?:www\.)?kuaishou\.com)\//i.test(url);
 }
 
+function isDouyinShortUrl(url) {
+  return /(?:^|\/\/)v\.douyin\.com\//i.test(url);
+}
+
+function isDouyinSharePageUrl(url) {
+  return /(?:^|\/\/)(?:www\.)?iesdouyin\.com\/share\/video\//i.test(url);
+}
+
+function isDouyinUrl(url) {
+  return /(?:^|\/\/)(?:v\.douyin\.com|(?:www\.)?douyin\.com|(?:www\.)?iesdouyin\.com)\//i.test(url);
+}
+
+function extractDouyinVideoId(url) {
+  if (typeof url !== "string") return null;
+
+  const videoId =
+    url.match(/douyin\.com\/video\/(\d+)(?:[/?#]|$)/i)?.[1] ||
+    url.match(/iesdouyin\.com\/share\/video\/(\d+)(?:[/?#]|$)/i)?.[1];
+
+  return videoId || null;
+}
+
 function isYouTubeUrl(url) {
   return /(?:^|\/\/)(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
 }
@@ -149,8 +179,35 @@ function mapDirectSourcesToChoices(sources) {
   return sources.map((source, index) => ({
     text: source.label || `Direct ${index + 1}`,
     directUrl: source.directUrl,
+    headers: source.headers,
     kind: "video",
   }));
+}
+
+function formatDouyinSourceLabel(video = {}) {
+  const width = Number(video?.width || 0);
+  const height = Number(video?.height || 0);
+  const shortEdge = Math.min(width || 0, height || 0);
+  if (shortEdge > 0) {
+    return `${shortEdge}p`;
+  }
+
+  const firstUrl = Array.isArray(video?.play_addr?.url_list) ? video.play_addr.url_list[0] : null;
+  if (typeof firstUrl === "string") {
+    try {
+      const ratio = new URL(firstUrl).searchParams.get("ratio");
+      if (ratio) return ratio;
+    } catch {
+      // Ignore malformed URLs and fall back to a generic label.
+    }
+  }
+
+  return "Default";
+}
+
+function normalizeDouyinPlayUrl(url) {
+  if (typeof url !== "string" || !url.startsWith("http")) return null;
+  return url.replace("/playwm/", "/play/");
 }
 
 function extractKuaishouSourcesFromHtml(html) {
@@ -183,13 +240,123 @@ function extractKuaishouSourcesFromHtml(html) {
   return sources;
 }
 
-async function downloadDirectFile(url, filePath) {
+function buildDouyinShareCandidates(inputUrl, finalUrl) {
+  const candidates = [];
+  const videoId = extractDouyinVideoId(finalUrl) || extractDouyinVideoId(inputUrl);
+
+  if (videoId) {
+    candidates.push(`https://www.iesdouyin.com/share/video/${videoId}/`);
+  }
+
+  for (const candidate of [inputUrl, finalUrl]) {
+    if (!candidate) continue;
+    if (isDouyinShortUrl(candidate) || isDouyinSharePageUrl(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+
+  return [...new Set(candidates)];
+}
+
+function extractDouyinSourcesFromHtml(html) {
+  const routerDataMatch = html.match(
+    /window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/i
+  );
+  if (!routerDataMatch) {
+    throw new Error("Douyin fallback could not find router data in share page.");
+  }
+
+  let routerData;
+  try {
+    routerData = JSON.parse(routerDataMatch[1]);
+  } catch (error) {
+    throw new Error(`Douyin fallback router data parse failed: ${error.message}`);
+  }
+
+  const loaderValues = Object.values(routerData?.loaderData || {});
+  const pageData = loaderValues.find((entry) =>
+    Array.isArray(entry?.videoInfoRes?.item_list)
+  );
+  const item = pageData?.videoInfoRes?.item_list?.find((entry) =>
+    Array.isArray(entry?.video?.play_addr?.url_list) && entry.video.play_addr.url_list.length > 0
+  );
+
+  if (!item) {
+    throw new Error("Douyin fallback page does not contain a playable video.");
+  }
+
+  const playUrls = item.video.play_addr.url_list
+    .map((value) => normalizeDouyinPlayUrl(value))
+    .filter((value, index, values) => value && values.indexOf(value) === index);
+
+  if (playUrls.length === 0) {
+    throw new Error("Douyin fallback could not extract a direct play URL.");
+  }
+
+  const label = formatDouyinSourceLabel(item.video);
+  const sources = playUrls.map((directUrl) => ({
+    label,
+    directUrl,
+    headers: MOBILE_SHARE_HEADERS,
+  }));
+
+  const coverUrls = Array.isArray(item?.video?.cover?.url_list)
+    ? item.video.cover.url_list.filter((value) => typeof value === "string" && value.startsWith("http"))
+    : [];
+  const thumbnailUrl = coverUrls.length > 0 ? coverUrls[coverUrls.length - 1] : null;
+
+  return {
+    sources,
+    thumbnailUrl,
+  };
+}
+
+async function getDouyinFallbackSources(inputUrl, finalUrl) {
+  const candidates = buildDouyinShareCandidates(inputUrl, finalUrl);
+  if (candidates.length === 0) {
+    throw new Error("Douyin fallback could not determine a share page URL.");
+  }
+
+  let lastError = null;
+
+  for (const candidateUrl of candidates) {
+    try {
+      log(`[fallback] Douyin page parse start: ${candidateUrl}`);
+      const response = await axios({
+        method: "GET",
+        url: candidateUrl,
+        timeout: REDIRECT_TIMEOUT_MS,
+        maxRedirects: 10,
+        headers: MOBILE_SHARE_HEADERS,
+        validateStatus: () => true,
+      });
+
+      if (response.status >= 400 || typeof response.data !== "string") {
+        throw new Error(`Douyin fallback page fetch failed (status ${response.status}).`);
+      }
+
+      const extracted = extractDouyinSourcesFromHtml(response.data);
+      log(`[fallback] Douyin play URL extracted (${extracted.sources.length} source(s)).`);
+      return extracted;
+    } catch (error) {
+      lastError = error;
+      log(`[fallback] Douyin candidate failed for ${candidateUrl}: ${error.message}`);
+    }
+  }
+
+  throw lastError || new Error("Douyin fallback could not extract a playable video.");
+}
+
+async function downloadDirectFile(url, filePath, requestHeaders = undefined) {
   const response = await axios({
     method: "GET",
     url,
     responseType: "stream",
     timeout: 60000,
-    headers: RESOLVE_HEADERS,
+    headers: {
+      ...RESOLVE_HEADERS,
+      ...(requestHeaders || {}),
+    },
     validateStatus: (status) => status >= 200 && status < 300,
   });
 
@@ -234,7 +401,7 @@ async function getKuaishouFallbackSources(pageUrl) {
 
 function shouldUseCookies(url) {
   if (!COOKIES_FROM_BROWSER || cookiesTemporarilyDisabled) return false;
-  return /(facebook\.com|fb\.watch|instagram\.com)/i.test(url);
+  return /(facebook\.com|fb\.watch|instagram\.com|douyin\.com|iesdouyin\.com|tiktok\.com)/i.test(url);
 }
 
 function isCookieLoadError(errorText) {
@@ -244,6 +411,10 @@ function isCookieLoadError(errorText) {
     text.includes("failed to decrypt with dpapi") ||
     text.includes("failed to decrypt cookies")
   );
+}
+
+function isDouyinFreshCookieError(errorText) {
+  return /fresh cookies .* needed/i.test(errorText);
 }
 
 async function ensureDownloadDir() {
@@ -664,7 +835,7 @@ async function handleSelectionDownload(
 
     if (selection.sourceType === "direct" && choice.directUrl) {
       downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp4`);
-      await downloadDirectFile(choice.directUrl, downloadedFilePath);
+      await downloadDirectFile(choice.directUrl, downloadedFilePath, choice.headers);
     } else if (choice.kind === "audio") {
       await runYtDlpDownload(
         sourceUrl,
@@ -836,6 +1007,7 @@ bot.on("message", async (msg) => {
     const finalUrl = await resolveFinalUrl(extractedUrl);
     log(`[message] finalUrl=${finalUrl}`);
     const shouldTryKuaishouFallback = isKuaishouUrl(extractedUrl) || isKuaishouUrl(finalUrl);
+    const shouldTryDouyinFallback = isDouyinUrl(extractedUrl) || isDouyinUrl(finalUrl);
 
     await bot.sendMessage(chatId, "Checking available qualities...");
 
@@ -860,6 +1032,16 @@ bot.on("message", async (msg) => {
         }
         sourceType = "direct";
       }
+
+      if (choices.length === 0 && shouldTryDouyinFallback) {
+        log("[fallback] Triggered for Douyin URL with empty yt-dlp quality list.");
+        const { sources, thumbnailUrl } = await getDouyinFallbackSources(extractedUrl, finalUrl);
+        choices = mapDirectSourcesToChoices(sources);
+        if (!previewImageUrl) {
+          previewImageUrl = thumbnailUrl;
+        }
+        sourceType = "direct";
+      }
     } catch (error) {
       const errorText = error?.stack || error?.message || String(error);
       if (isUnsupportedUrlError(errorText) && shouldTryKuaishouFallback) {
@@ -869,6 +1051,15 @@ bot.on("message", async (msg) => {
           log("[fallback] Triggered for unsupported Kuaishou URL.");
         }
         const { sources, thumbnailUrl } = await getKuaishouFallbackSources(finalUrl);
+        choices = mapDirectSourcesToChoices(sources);
+        previewImageUrl = thumbnailUrl;
+        sourceType = "direct";
+      } else if (
+        (isUnsupportedUrlError(errorText) || isDouyinFreshCookieError(errorText)) &&
+        shouldTryDouyinFallback
+      ) {
+        log("[fallback] Triggered for Douyin URL after yt-dlp failure.");
+        const { sources, thumbnailUrl } = await getDouyinFallbackSources(extractedUrl, finalUrl);
         choices = mapDirectSourcesToChoices(sources);
         previewImageUrl = thumbnailUrl;
         sourceType = "direct";
@@ -882,6 +1073,11 @@ bot.on("message", async (msg) => {
         await bot.sendMessage(
           chatId,
           "No downloadable video stream found for this Kuaishou link (it may be photo-only, private, or region-limited)."
+        );
+      } else if (shouldTryDouyinFallback) {
+        await bot.sendMessage(
+          chatId,
+          "No downloadable video stream found for this Douyin link (it may be photo-only, private, or region-limited)."
         );
       } else {
         await bot.sendMessage(chatId, "No downloadable quality options found for this link.");
