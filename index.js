@@ -371,6 +371,68 @@ async function downloadDirectFile(url, filePath, requestHeaders = undefined) {
   });
 }
 
+function getFfmpegBinary() {
+  if (FFMPEG_LOCATION) {
+    const lower = FFMPEG_LOCATION.toLowerCase();
+    if (lower.endsWith(".exe") || lower.endsWith("/ffmpeg") || lower.endsWith("\\ffmpeg")) {
+      return FFMPEG_LOCATION;
+    }
+
+    return path.join(
+      FFMPEG_LOCATION,
+      process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg"
+    );
+  }
+
+  return process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+}
+
+async function extractAudioWithFfmpeg(inputPath, outputPath) {
+  const ffmpegBinary = getFfmpegBinary();
+  const args = [
+    "-y",
+    "-i",
+    inputPath,
+    "-vn",
+    "-acodec",
+    "libmp3lame",
+    "-b:a",
+    "192k",
+    outputPath,
+  ];
+
+  log(`[ffmpeg] Command: ${ffmpegBinary} ${args.join(" ")}`);
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(ffmpegBinary, args, {
+      windowsHide: true,
+    });
+
+    let stderr = "";
+
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      process.stderr.write(`[ffmpeg] ${text}`);
+    });
+
+    child.on("error", (error) => {
+      reject(new Error(`Failed to start ffmpeg process: ${error.message}`));
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(
+        new Error(`ffmpeg exited with code ${code}.\n${stderr || "No output"}`)
+      );
+    });
+  });
+}
+
 async function getKuaishouFallbackSources(pageUrl) {
   log(`[fallback] Kuaishou page parse start: ${pageUrl}`);
 
@@ -831,6 +893,7 @@ async function handleSelectionDownload(
   selection.downloading = true;
 
   let downloadedFilePath = "";
+  const temporaryFilePaths = [];
   const resultReplyMarkup = options.replyMarkup ? { reply_markup: options.replyMarkup } : {};
   const cleanupMessageIds = Array.isArray(options.cleanupMessageIds)
     ? options.cleanupMessageIds.filter(Boolean)
@@ -852,7 +915,13 @@ async function handleSelectionDownload(
       return;
     }
 
-    if (selection.sourceType === "direct" && choice.directUrl) {
+    if (choice.kind === "audio" && selection.sourceType === "direct" && choice.directUrl) {
+      const sourceVideoPath = path.join(DOWNLOAD_DIR, `${baseName}.source.mp4`);
+      downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp3`);
+      temporaryFilePaths.push(sourceVideoPath);
+      await downloadDirectFile(choice.directUrl, sourceVideoPath, choice.headers);
+      await extractAudioWithFfmpeg(sourceVideoPath, downloadedFilePath);
+    } else if (selection.sourceType === "direct" && choice.directUrl) {
       downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp4`);
       await downloadDirectFile(choice.directUrl, downloadedFilePath, choice.headers);
     } else if (choice.kind === "audio") {
@@ -937,6 +1006,9 @@ async function handleSelectionDownload(
     }
     await safeDeleteMessages(chatId, cleanupMessageIds);
     await safeDelete(downloadedFilePath);
+    for (const filePath of temporaryFilePaths) {
+      await safeDelete(filePath);
+    }
   }
 }
 
@@ -1106,13 +1178,23 @@ bot.on("message", async (msg) => {
     const timer = setTimeout(() => cleanupSelection(selectionId), SELECTION_TTL_MS);
     if (typeof timer.unref === "function") timer.unref();
     const hdChoiceIndex = choices.length - 1;
+    const bestDirectChoice = sourceType === "direct" && hdChoiceIndex >= 0
+      ? choices[hdChoiceIndex]
+      : null;
     const audioChoice = sourceType === "ytdlp"
       ? {
         text: "Audio",
         kind: "audio",
         formatSelector: "bestaudio/best",
       }
-      : null;
+      : bestDirectChoice?.directUrl
+        ? {
+          text: "Audio",
+          kind: "audio",
+          directUrl: bestDirectChoice.directUrl,
+          headers: bestDirectChoice.headers,
+        }
+        : null;
 
     pendingSelections.set(selectionId, {
       chatId,
