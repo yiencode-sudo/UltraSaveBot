@@ -78,12 +78,18 @@ function log(message, ...args) {
   console.log(`[${now}] ${message}`, ...args);
 }
 
-function extractFirstUrl(text) {
-  const match = text.match(/https?:\/\/[^\s]+/i);
-  if (!match) return null;
+function extractUrls(text) {
+  const matches = text.match(/https?:\/\/[^\s]+/gi) || [];
 
-  // Remove common trailing punctuation from copied messages.
-  return match[0].replace(/[)\]}",.!?]+$/g, "");
+  const cleaned = matches
+    .map((value) => value.replace(/[)\]}",.!?，。；：”’]+$/g, ""))
+    .filter(Boolean);
+
+  return [...new Set(cleaned)];
+}
+
+function extractFirstUrl(text) {
+  return extractUrls(text)[0] || null;
 }
 
 function formatMb(bytes) {
@@ -1066,28 +1072,17 @@ bot.onText(/^\/start$/, async (msg) => {
   const chatId = msg.chat.id;
   const text =
     "Send a video URL (TikTok, Kuaishou, YouTube, Instagram, Facebook, etc.).\n" +
-    `I will resolve short links, let you choose quality, then send MP4 (configured max ${MAX_DOWNLOAD_MB}MB).`;
+    `I will resolve short links, let you choose quality, then send MP4 (configured max ${MAX_DOWNLOAD_MB}MB). You can also paste multiple links in one message.`;
 
   await bot.sendMessage(chatId, text);
 });
 
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
-  if (msg.text.startsWith("/")) return;
-
-  const chatId = msg.chat.id;
-  const originalText = msg.text.trim();
+async function processIncomingUrl(chatId, extractedUrl, originalText) {
   const transientMessageIds = [];
-
-  const extractedUrl = extractFirstUrl(originalText);
-
-  if (!extractedUrl) {
-    await bot.sendMessage(chatId, "Please send a valid video URL.");
-    return;
-  }
 
   try {
     log(`[message] chat=${chatId} input=${originalText}`);
+    log(`[message] extractedUrl=${extractedUrl}`);
 
     const resolvingMessage = await bot.sendMessage(chatId, "Resolving link...");
     transientMessageIds.push(resolvingMessage.message_id);
@@ -1269,6 +1264,25 @@ bot.on("message", async (msg) => {
     log(`[error] ${errorText}`);
     await safeDeleteMessages(chatId, transientMessageIds);
     await bot.sendMessage(chatId, getFriendlyErrorMessage(errorText));
+  }
+}
+
+bot.on("message", async (msg) => {
+  if (!msg.text) return;
+  if (msg.text.startsWith("/")) return;
+
+  const chatId = msg.chat.id;
+  const originalText = msg.text.trim();
+
+  const extractedUrls = extractUrls(originalText);
+
+  if (extractedUrls.length === 0) {
+    await bot.sendMessage(chatId, "Please send a valid video URL.");
+    return;
+  }
+
+  for (const extractedUrl of extractedUrls) {
+    await processIncomingUrl(chatId, extractedUrl, originalText);
   }
 });
 
