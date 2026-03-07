@@ -772,6 +772,22 @@ async function safeDelete(filePath) {
   }
 }
 
+async function safeDeleteMessage(chatId, messageId) {
+  if (!chatId || !messageId) return;
+
+  try {
+    await bot.deleteMessage(chatId, String(messageId));
+  } catch (error) {
+    log(`[delete-message-error] ${error?.message || String(error)}`);
+  }
+}
+
+async function safeDeleteMessages(chatId, messageIds = []) {
+  for (const messageId of messageIds) {
+    await safeDeleteMessage(chatId, messageId);
+  }
+}
+
 async function safeAnswerCallback(queryId, options = undefined) {
   try {
     if (options) {
@@ -816,6 +832,9 @@ async function handleSelectionDownload(
 
   let downloadedFilePath = "";
   const resultReplyMarkup = options.replyMarkup ? { reply_markup: options.replyMarkup } : {};
+  const cleanupMessageIds = Array.isArray(options.cleanupMessageIds)
+    ? options.cleanupMessageIds.filter(Boolean)
+    : [];
   let sentMediaMessage = null;
 
   try {
@@ -902,11 +921,7 @@ async function handleSelectionDownload(
     }
 
     if (options.removeMessageId && sentMediaMessage?.message_id) {
-      try {
-        await bot.deleteMessage(chatId, String(options.removeMessageId));
-      } catch (deleteError) {
-        log(`[delete-message-error] ${deleteError?.message || String(deleteError)}`);
-      }
+      await safeDeleteMessage(chatId, options.removeMessageId);
     }
 
     log(`[send] Video sent to chat=${chatId}`);
@@ -923,6 +938,7 @@ async function handleSelectionDownload(
     if (!options.keepSelection) {
       cleanupSelection(selectionId);
     }
+    await safeDeleteMessages(chatId, cleanupMessageIds);
     await safeDelete(downloadedFilePath);
   }
 }
@@ -992,6 +1008,7 @@ bot.on("message", async (msg) => {
 
   const chatId = msg.chat.id;
   const originalText = msg.text.trim();
+  const transientMessageIds = [];
 
   const extractedUrl = extractFirstUrl(originalText);
 
@@ -1003,13 +1020,15 @@ bot.on("message", async (msg) => {
   try {
     log(`[message] chat=${chatId} input=${originalText}`);
 
-    await bot.sendMessage(chatId, "Resolving link...");
+    const resolvingMessage = await bot.sendMessage(chatId, "Resolving link...");
+    transientMessageIds.push(resolvingMessage.message_id);
     const finalUrl = await resolveFinalUrl(extractedUrl);
     log(`[message] finalUrl=${finalUrl}`);
     const shouldTryKuaishouFallback = isKuaishouUrl(extractedUrl) || isKuaishouUrl(finalUrl);
     const shouldTryDouyinFallback = isDouyinUrl(extractedUrl) || isDouyinUrl(finalUrl);
 
-    await bot.sendMessage(chatId, "Checking available qualities...");
+    const checkingMessage = await bot.sendMessage(chatId, "Checking available qualities...");
+    transientMessageIds.push(checkingMessage.message_id);
 
     let sourceType = "ytdlp";
     let choices = [];
@@ -1069,6 +1088,7 @@ bot.on("message", async (msg) => {
     }
 
     if (choices.length === 0) {
+      await safeDeleteMessages(chatId, transientMessageIds);
       if (shouldTryKuaishouFallback) {
         await bot.sendMessage(
           chatId,
@@ -1156,15 +1176,17 @@ bot.on("message", async (msg) => {
     if (AUTO_DOWNLOAD) {
       const autoIndex = Number.isInteger(hdChoiceIndex) ? hdChoiceIndex : 0;
       await handleSelectionDownload(chatId, selectionId, autoIndex, null, {
-        keepSelection: true,
         silent: true,
-        replyMarkup: { inline_keyboard: inlineKeyboard },
+        cleanupMessageIds: transientMessageIds,
         removeMessageId: cardMessageId,
       });
+    } else {
+      await safeDeleteMessages(chatId, transientMessageIds);
     }
   } catch (error) {
     const errorText = error?.stack || error?.message || String(error);
     log(`[error] ${errorText}`);
+    await safeDeleteMessages(chatId, transientMessageIds);
     await bot.sendMessage(chatId, getFriendlyErrorMessage(errorText));
   }
 });
