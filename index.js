@@ -899,12 +899,10 @@ async function handleSelectionDownload(
     try {
       if (choice.kind === "audio") {
         sentMediaMessage = await bot.sendAudio(chatId, downloadedFilePath, {
-          caption: `Download complete (${choice.text}).`,
           ...resultReplyMarkup,
         });
       } else {
         sentMediaMessage = await bot.sendVideo(chatId, downloadedFilePath, {
-          caption: `Download complete (${choice.text}).`,
           supports_streaming: true,
           ...resultReplyMarkup,
         });
@@ -915,7 +913,6 @@ async function handleSelectionDownload(
 
       await bot.sendChatAction(chatId, "upload_document");
       sentMediaMessage = await bot.sendDocument(chatId, downloadedFilePath, {
-        caption: `Download complete (${choice.text}).`,
         ...resultReplyMarkup,
       });
     }
@@ -1176,7 +1173,9 @@ bot.on("message", async (msg) => {
     if (AUTO_DOWNLOAD) {
       const autoIndex = Number.isInteger(hdChoiceIndex) ? hdChoiceIndex : 0;
       await handleSelectionDownload(chatId, selectionId, autoIndex, null, {
+        keepSelection: true,
         silent: true,
+        replyMarkup: { inline_keyboard: inlineKeyboard },
         cleanupMessageIds: transientMessageIds,
         removeMessageId: cardMessageId,
       });
