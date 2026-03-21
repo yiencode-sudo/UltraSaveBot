@@ -59,13 +59,20 @@ const RESOLVE_HEADERS = {
     "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 };
-const MOBILE_SHARE_HEADERS = {
+const DOUYIN_MOBILE_SHARE_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36",
   Accept: RESOLVE_HEADERS.Accept,
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   Referer: "https://www.douyin.com/",
+};
+const KUAISHOU_MOBILE_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 " +
+    "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  Accept: RESOLVE_HEADERS.Accept,
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 };
 
 // Initialize Telegram bot with polling.
@@ -284,6 +291,231 @@ function extractKuaishouSourcesFromHtml(html) {
   return sources;
 }
 
+function extractWindowJsonAssignment(html, variableName) {
+  const marker = `${variableName} = `;
+  const markerIndex = html.indexOf(marker);
+  if (markerIndex < 0) {
+    throw new Error(`${variableName} assignment was not found in HTML.`);
+  }
+
+  const jsonStart = html.indexOf("{", markerIndex + marker.length);
+  if (jsonStart < 0) {
+    throw new Error(`${variableName} assignment does not contain a JSON object.`);
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = jsonStart; index < html.length; index += 1) {
+    const char = html[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return JSON.parse(html.slice(jsonStart, index + 1));
+      }
+    }
+  }
+
+  throw new Error(`${variableName} JSON block is incomplete.`);
+}
+
+function extractKuaishouIdentifiers(url) {
+  const identifiers = new Set();
+  const addIdentifier = (value) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length < 6) return;
+    if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) return;
+    identifiers.add(trimmed);
+  };
+
+  try {
+    const parsed = new URL(url);
+    for (const key of ["photoId", "shareObjectId", "shareToken"]) {
+      addIdentifier(parsed.searchParams.get(key));
+    }
+
+    for (const segment of parsed.pathname.split("/")) {
+      const lowered = segment.toLowerCase();
+      if (!segment || ["fw", "photo", "short-video"].includes(lowered)) continue;
+      addIdentifier(segment);
+    }
+  } catch {
+    // Ignore malformed URLs and return best-effort identifiers.
+  }
+
+  return [...identifiers];
+}
+
+function flattenKuaishouManifestRepresentations(photo = {}) {
+  const adaptationSet = Array.isArray(photo?.manifest?.adaptationSet)
+    ? photo.manifest.adaptationSet
+    : [];
+
+  return adaptationSet.flatMap((item) =>
+    Array.isArray(item?.representation) ? item.representation : []
+  );
+}
+
+function formatKuaishouSourceLabel(representation = {}) {
+  const qualityType = typeof representation?.qualityType === "string"
+    ? representation.qualityType.trim()
+    : "";
+  if (/^\d+p$/i.test(qualityType)) {
+    return qualityType.toLowerCase();
+  }
+
+  const shortEdge = Math.min(
+    Number(representation?.height || 0),
+    Number(representation?.width || 0)
+  );
+  if (shortEdge > 0) {
+    return `${shortEdge}p`;
+  }
+
+  const qualityLabel = typeof representation?.qualityLabel === "string"
+    ? representation.qualityLabel.trim()
+    : "";
+  if (qualityLabel) {
+    return qualityLabel;
+  }
+
+  return "Default";
+}
+
+function collectKuaishouPhotoCandidates(initState) {
+  const candidates = [];
+  const stack = [initState];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") continue;
+
+    if (Array.isArray(current)) {
+      stack.push(...current);
+      continue;
+    }
+
+    if (current.photo && typeof current.photo === "object") {
+      candidates.push(current);
+    }
+
+    stack.push(...Object.values(current));
+  }
+
+  return candidates;
+}
+
+function scoreKuaishouPhotoCandidate(candidate, identifiers = []) {
+  const photo = candidate?.photo;
+  if (!photo || typeof photo !== "object") return Number.NEGATIVE_INFINITY;
+
+  let score = 0;
+  const shareInfo = typeof photo.share_info === "string" ? photo.share_info : "";
+  const candidateIds = [
+    photo.photoId,
+    photo.id,
+    photo.userEid,
+  ].filter((value) => typeof value === "string");
+
+  for (const identifier of identifiers) {
+    if (candidateIds.includes(identifier)) score += 100;
+    if (shareInfo.includes(identifier)) score += 140;
+  }
+
+  const repCount = flattenKuaishouManifestRepresentations(photo).length;
+  score += repCount * 20;
+  if (Array.isArray(photo?.mainMvUrls) && photo.mainMvUrls.length > 0) score += 40;
+  if (Array.isArray(photo?.coverUrls) && photo.coverUrls.length > 0) score += 15;
+  if (typeof photo?.caption === "string" && photo.caption.trim()) score += 10;
+  if (typeof photo?.photoType === "string" && /video/i.test(photo.photoType)) score += 30;
+  if (candidate?.result === 1) score += 10;
+
+  return score;
+}
+
+function extractKuaishouSourcesFromMobileHtml(html, pageUrl) {
+  const initState = extractWindowJsonAssignment(html, "window.INIT_STATE");
+  const identifiers = extractKuaishouIdentifiers(pageUrl);
+  const candidates = collectKuaishouPhotoCandidates(initState);
+
+  if (candidates.length === 0) {
+    throw new Error("Kuaishou mobile fallback could not find photo data in INIT_STATE.");
+  }
+
+  const bestCandidate = candidates
+    .map((candidate) => ({
+      candidate,
+      score: scoreKuaishouPhotoCandidate(candidate, identifiers),
+    }))
+    .sort((a, b) => b.score - a.score)[0]?.candidate;
+
+  const photo = bestCandidate?.photo;
+  if (!photo || typeof photo !== "object") {
+    throw new Error("Kuaishou mobile fallback did not locate a usable photo payload.");
+  }
+
+  const sources = [];
+  const seen = new Set();
+  const addSource = (label, value) => {
+    if (!value) return;
+    const decoded = decodeEscapedUrl(String(value));
+    if (!decoded.startsWith("http") || seen.has(decoded)) return;
+    seen.add(decoded);
+    sources.push({ label, directUrl: decoded });
+  };
+
+  for (const representation of flattenKuaishouManifestRepresentations(photo)) {
+    const baseLabel = formatKuaishouSourceLabel(representation);
+    const codecText = `${representation?.videoCodec || ""} ${representation?.codecs || ""}`;
+    const codecSuffix = /(?:hevc|h265)/i.test(codecText) ? " H265" : "";
+    addSource(`${baseLabel}${codecSuffix}`, representation?.url);
+    addSource(`${baseLabel}${codecSuffix}`, Array.isArray(representation?.backupUrl)
+      ? representation.backupUrl[0]
+      : null);
+  }
+
+  for (const item of Array.isArray(photo?.mainMvUrls) ? photo.mainMvUrls : []) {
+    addSource("Default", item?.url);
+  }
+
+  addSource("Default", photo?.photoUrl);
+  addSource("H265", photo?.photoH265Url);
+
+  if (sources.length === 0) {
+    throw new Error("Kuaishou mobile fallback found the post but no playable video URL.");
+  }
+
+  const coverList = Array.isArray(photo?.coverUrls) ? photo.coverUrls : [];
+  const thumbnailUrl = coverList.find((item) => typeof item?.url === "string")?.url ||
+    (typeof photo?.headUrl === "string" ? photo.headUrl : null);
+
+  return { sources, thumbnailUrl };
+}
+
 function buildDouyinShareCandidates(inputUrl, finalUrl) {
   const candidates = [];
   const videoId = extractDouyinVideoId(finalUrl) || extractDouyinVideoId(inputUrl);
@@ -341,7 +573,7 @@ function extractDouyinSourcesFromHtml(html) {
   const sources = playUrls.map((directUrl) => ({
     label,
     directUrl,
-    headers: MOBILE_SHARE_HEADERS,
+    headers: DOUYIN_MOBILE_SHARE_HEADERS,
   }));
 
   const coverUrls = Array.isArray(item?.video?.cover?.url_list)
@@ -371,7 +603,7 @@ async function getDouyinFallbackSources(inputUrl, finalUrl) {
         url: candidateUrl,
         timeout: REDIRECT_TIMEOUT_MS,
         maxRedirects: 10,
-        headers: MOBILE_SHARE_HEADERS,
+        headers: DOUYIN_MOBILE_SHARE_HEADERS,
         validateStatus: () => true,
       });
 
@@ -478,31 +710,63 @@ async function extractAudioWithFfmpeg(inputPath, outputPath) {
 }
 
 async function getKuaishouFallbackSources(pageUrl) {
-  log(`[fallback] Kuaishou page parse start: ${pageUrl}`);
+  let lastError = null;
 
-  const response = await axios({
-    method: "GET",
-    url: pageUrl,
-    timeout: REDIRECT_TIMEOUT_MS,
-    maxRedirects: 5,
-    headers: RESOLVE_HEADERS,
-    validateStatus: () => true,
-  });
+  try {
+    log(`[fallback] Kuaishou mobile page parse start: ${pageUrl}`);
+    const mobileResponse = await axios({
+      method: "GET",
+      url: pageUrl,
+      timeout: REDIRECT_TIMEOUT_MS,
+      maxRedirects: 10,
+      headers: KUAISHOU_MOBILE_HEADERS,
+      validateStatus: () => true,
+    });
 
-  if (response.status >= 400 || typeof response.data !== "string") {
-    throw new Error(`Kuaishou fallback page fetch failed (status ${response.status}).`);
+    if (mobileResponse.status >= 400 || typeof mobileResponse.data !== "string") {
+      throw new Error(`Kuaishou mobile page fetch failed (status ${mobileResponse.status}).`);
+    }
+
+    const finalMobileUrl = mobileResponse.request?.res?.responseUrl || pageUrl;
+    const extracted = extractKuaishouSourcesFromMobileHtml(mobileResponse.data, finalMobileUrl);
+    log(`[fallback] Kuaishou mobile sources extracted (${extracted.sources.length} source(s)).`);
+    return extracted;
+  } catch (error) {
+    lastError = error;
+    log(`[fallback] Kuaishou mobile parse failed: ${error.message}`);
   }
 
-  const sources = extractKuaishouSourcesFromHtml(response.data);
-  if (sources.length === 0) {
-    throw new Error("Kuaishou fallback could not extract MP4 URL from page.");
+  try {
+    log(`[fallback] Kuaishou desktop page parse start: ${pageUrl}`);
+    const response = await axios({
+      method: "GET",
+      url: pageUrl,
+      timeout: REDIRECT_TIMEOUT_MS,
+      maxRedirects: 5,
+      headers: RESOLVE_HEADERS,
+      validateStatus: () => true,
+    });
+
+    if (response.status >= 400 || typeof response.data !== "string") {
+      throw new Error(`Kuaishou fallback page fetch failed (status ${response.status}).`);
+    }
+
+    const sources = extractKuaishouSourcesFromHtml(response.data);
+    if (sources.length === 0) {
+      throw new Error("Kuaishou fallback could not extract MP4 URL from page.");
+    }
+
+    const coverRaw = response.data.match(/"coverUrl":"([^"]+)"/i)?.[1];
+    const thumbnailUrl = coverRaw ? decodeEscapedUrl(coverRaw) : null;
+
+    log(`[fallback] Kuaishou desktop MP4 URL extracted (${sources.length} source(s)).`);
+    return { sources, thumbnailUrl };
+  } catch (error) {
+    lastError = error;
+    log(`[fallback] Kuaishou desktop parse failed: ${error.message}`);
   }
 
-  const coverRaw = response.data.match(/"coverUrl":"([^"]+)"/i)?.[1];
-  const thumbnailUrl = coverRaw ? decodeEscapedUrl(coverRaw) : null;
-
-  log(`[fallback] Kuaishou MP4 URL extracted (${sources.length} source(s)).`);
-  return { sources, thumbnailUrl };
+  throw lastError || new Error("Kuaishou fallback did not find a downloadable source.");
 }
 
 function shouldUseCookies(url) {
