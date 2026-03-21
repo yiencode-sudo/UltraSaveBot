@@ -235,6 +235,30 @@ function mapDirectSourcesToChoices(sources) {
   }));
 }
 
+function getBestDirectChoiceIndex(choices = []) {
+  if (!Array.isArray(choices) || choices.length === 0) return -1;
+
+  let bestIndex = 0;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const [index, choice] of choices.entries()) {
+    const text = String(choice?.text || "");
+    const height = Number(text.match(/(\d+)p/i)?.[1] || 0);
+    let score = height * 100;
+
+    if (/h265|hevc/i.test(text)) score += 10;
+    if (/default/i.test(text)) score -= 1000;
+    if (/direct/i.test(text)) score -= 500;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
+}
+
 function formatDouyinSourceLabel(video = {}) {
   const width = Number(video?.width || 0);
   const height = Number(video?.height || 0);
@@ -289,6 +313,13 @@ function extractKuaishouSourcesFromHtml(html) {
   }
 
   return sources;
+}
+
+function buildKuaishouDirectHeaders(pageUrl) {
+  return {
+    ...KUAISHOU_MOBILE_HEADERS,
+    Referer: pageUrl,
+  };
 }
 
 function extractWindowJsonAssignment(html, variableName) {
@@ -480,12 +511,13 @@ function extractKuaishouSourcesFromMobileHtml(html, pageUrl) {
 
   const sources = [];
   const seen = new Set();
+  const directHeaders = buildKuaishouDirectHeaders(pageUrl);
   const addSource = (label, value) => {
     if (!value) return;
     const decoded = decodeEscapedUrl(String(value));
     if (!decoded.startsWith("http") || seen.has(decoded)) return;
     seen.add(decoded);
-    sources.push({ label, directUrl: decoded });
+    sources.push({ label, directUrl: decoded, headers: directHeaders });
   };
 
   for (const representation of flattenKuaishouManifestRepresentations(photo)) {
@@ -514,6 +546,61 @@ function extractKuaishouSourcesFromMobileHtml(html, pageUrl) {
     (typeof photo?.headUrl === "string" ? photo.headUrl : null);
 
   return { sources, thumbnailUrl };
+}
+
+function pickMatchingDirectChoice(targetChoice, choices = []) {
+  if (!targetChoice || !Array.isArray(choices) || choices.length === 0) return null;
+
+  const normalizedText = String(targetChoice?.text || "").trim().toLowerCase();
+  if (!normalizedText) return choices[0] || null;
+
+  const exactMatch = choices.find(
+    (choice) => String(choice?.text || "").trim().toLowerCase() === normalizedText
+  );
+  if (exactMatch) return exactMatch;
+
+  const targetHeight = Number(normalizedText.match(/(\d+)p/i)?.[1] || 0);
+  const targetWantsH265 = /h265|hevc/i.test(normalizedText);
+
+  if (targetHeight > 0) {
+    const sameHeightChoices = choices.filter((choice) =>
+      Number(String(choice?.text || "").match(/(\d+)p/i)?.[1] || 0) === targetHeight
+    );
+    if (sameHeightChoices.length > 0) {
+      const codecMatch = sameHeightChoices.find((choice) =>
+        /h265|hevc/i.test(String(choice?.text || "")) === targetWantsH265
+      );
+      return codecMatch || sameHeightChoices[0];
+    }
+  }
+
+  const codecMatch = choices.find((choice) =>
+    /h265|hevc/i.test(String(choice?.text || "")) === targetWantsH265
+  );
+  return codecMatch || choices[getBestDirectChoiceIndex(choices)] || choices[0];
+}
+
+async function downloadKuaishouDirectFileWithRetry(selection, choice, filePath) {
+  try {
+    await downloadDirectFile(choice.directUrl, filePath, choice.headers);
+  } catch (error) {
+    if (!isKuaishouUrl(selection?.finalUrl)) {
+      throw error;
+    }
+
+    log(`[fallback] Kuaishou direct download failed; refreshing source. ${error.message}`);
+    const refreshed = await getKuaishouFallbackSources(selection.finalUrl);
+    const refreshedChoices = mapDirectSourcesToChoices(refreshed.sources);
+    const retryChoice = choice.kind === "audio"
+      ? refreshedChoices[getBestDirectChoiceIndex(refreshedChoices)]
+      : pickMatchingDirectChoice(choice, refreshedChoices);
+
+    if (!retryChoice?.directUrl) {
+      throw error;
+    }
+
+    await downloadDirectFile(retryChoice.directUrl, filePath, retryChoice.headers);
+  }
 }
 
 function buildDouyinShareCandidates(inputUrl, finalUrl) {
@@ -751,7 +838,10 @@ async function getKuaishouFallbackSources(pageUrl) {
       throw new Error(`Kuaishou fallback page fetch failed (status ${response.status}).`);
     }
 
-    const sources = extractKuaishouSourcesFromHtml(response.data);
+    const sources = extractKuaishouSourcesFromHtml(response.data).map((source) => ({
+      ...source,
+      headers: buildKuaishouDirectHeaders(pageUrl),
+    }));
     if (sources.length === 0) {
       throw new Error("Kuaishou fallback could not extract MP4 URL from page.");
     }
@@ -1227,11 +1317,19 @@ async function handleSelectionDownload(
       const sourceVideoPath = path.join(DOWNLOAD_DIR, `${baseName}.source.mp4`);
       downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp3`);
       temporaryFilePaths.push(sourceVideoPath);
-      await downloadDirectFile(choice.directUrl, sourceVideoPath, choice.headers);
+      if (isKuaishouUrl(selection.finalUrl)) {
+        await downloadKuaishouDirectFileWithRetry(selection, choice, sourceVideoPath);
+      } else {
+        await downloadDirectFile(choice.directUrl, sourceVideoPath, choice.headers);
+      }
       await extractAudioWithFfmpeg(sourceVideoPath, downloadedFilePath);
     } else if (selection.sourceType === "direct" && choice.directUrl) {
       downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp4`);
-      await downloadDirectFile(choice.directUrl, downloadedFilePath, choice.headers);
+      if (isKuaishouUrl(selection.finalUrl)) {
+        await downloadKuaishouDirectFileWithRetry(selection, choice, downloadedFilePath);
+      } else {
+        await downloadDirectFile(choice.directUrl, downloadedFilePath, choice.headers);
+      }
     } else if (choice.kind === "audio") {
       await runYtDlpDownload(
         sourceUrl,
@@ -1367,6 +1465,18 @@ function getFriendlyErrorMessage(errorText) {
     return "Telegram rejected this upload as too large. Use smaller quality or run local Bot API server.";
   }
 
+  if (text.includes("request failed with status code 403")) {
+    return "Direct media access was blocked or expired. Send the link again and retry.";
+  }
+
+  if (text.includes("request failed with status code 404")) {
+    return "Direct media URL expired. Send the link again and retry.";
+  }
+
+  if (text.includes("timeout of") && text.includes("exceeded")) {
+    return "Source download timed out. Try the link again.";
+  }
+
   return "Failed to download this video. Check console logs for details.";
 }
 
@@ -1474,7 +1584,9 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
     const selectionId = crypto.randomBytes(5).toString("hex");
     const timer = setTimeout(() => cleanupSelection(selectionId), SELECTION_TTL_MS);
     if (typeof timer.unref === "function") timer.unref();
-    const hdChoiceIndex = choices.length - 1;
+    const hdChoiceIndex = sourceType === "direct"
+      ? getBestDirectChoiceIndex(choices)
+      : choices.length - 1;
     const bestDirectChoice = sourceType === "direct" && hdChoiceIndex >= 0
       ? choices[hdChoiceIndex]
       : null;
