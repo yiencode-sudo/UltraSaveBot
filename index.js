@@ -19,10 +19,43 @@ import TelegramBot from "node-telegram-bot-api";
 // - COOKIES_FROM_BROWSER (e.g. chrome, edge, firefox)
 dotenv.config({ quiet: true });
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) {
-  console.error("[startup] Missing BOT_TOKEN in .env");
+function readRequiredEnv(name) {
+  const value = process.env[name]?.trim();
+  if (value) {
+    return value;
+  }
+
+  console.error(
+    `[startup] Missing required environment variable ${name}. ` +
+    "Set it in Railway Variables, Render environment settings, or your local .env file."
+  );
   process.exit(1);
+}
+
+function readPositiveNumberEnv(name, fallbackValue) {
+  const rawValue = process.env[name]?.trim();
+  if (!rawValue) {
+    return fallbackValue;
+  }
+
+  const parsedValue = Number(rawValue);
+  if (Number.isFinite(parsedValue) && parsedValue > 0) {
+    return parsedValue;
+  }
+
+  console.warn(
+    `[startup] Invalid ${name}=${JSON.stringify(rawValue)}. ` +
+    `Falling back to ${fallbackValue}.`
+  );
+  return fallbackValue;
+}
+
+const BOT_TOKEN = readRequiredEnv("BOT_TOKEN");
+if (!/^\d+:[\w-]+$/.test(BOT_TOKEN)) {
+  console.warn(
+    "[startup] BOT_TOKEN does not look like a standard Telegram bot token. " +
+    "Polling will keep retrying until the token is corrected."
+  );
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -30,9 +63,9 @@ const __dirname = path.dirname(__filename);
 
 const DOWNLOAD_DIR = path.join(__dirname, "downloads");
 const TELEGRAM_CLOUD_LIMIT_BYTES = 50 * 1024 * 1024; // 50MB on default Bot API server
-const MAX_DOWNLOAD_MB = Number(process.env.MAX_DOWNLOAD_MB || 200);
+const MAX_DOWNLOAD_MB = readPositiveNumberEnv("MAX_DOWNLOAD_MB", 200);
 const MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024;
-const AUTO_DOWNLOAD = String(process.env.AUTO_DOWNLOAD ?? "true").toLowerCase() !== "false";
+const AUTO_DOWNLOAD = String(process.env.AUTO_DOWNLOAD ?? "true").trim().toLowerCase() !== "false";
 const REDIRECT_TIMEOUT_MS = 15000;
 const SELECTION_TTL_MS = 10 * 60 * 1000;
 
