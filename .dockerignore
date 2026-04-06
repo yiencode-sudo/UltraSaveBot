@@ -12,6 +12,7 @@ pnpm-debug.log*
 !.env.example
 
 downloads
+logs
 tmp
 temp
 

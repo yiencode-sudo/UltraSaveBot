@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:20-bookworm-slim
 
 ENV NODE_ENV=production \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
@@ -8,7 +8,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg python3 python3-venv ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg python3 python3-venv ca-certificates tini \
     && python3 -m venv "$VENV_PATH" \
     && "$VENV_PATH/bin/pip" install --no-cache-dir --upgrade pip yt-dlp \
     && rm -rf /var/lib/apt/lists/*
@@ -26,4 +26,5 @@ RUN mkdir -p /app/downloads \
 
 USER node
 
+ENTRYPOINT ["tini", "--"]
 CMD ["npm", "start"]

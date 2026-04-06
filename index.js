@@ -79,10 +79,28 @@ const KUAISHOU_MOBILE_HEADERS = {
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const pendingSelections = new Map();
 const activeSelectionByChat = new Map();
+let isShuttingDown = false;
 
 function log(message, ...args) {
   const now = new Date().toISOString();
   console.log(`[${now}] ${message}`, ...args);
+}
+
+async function shutdown(signal) {
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
+  log(`[shutdown] Received ${signal}. Stopping Telegram polling.`);
+
+  try {
+    await bot.stopPolling();
+  } catch (error) {
+    log(`[shutdown] stopPolling failed: ${error?.message || String(error)}`);
+  }
+
+  process.exit(0);
 }
 
 function extractUrls(text) {
@@ -1757,6 +1775,12 @@ bot.on("polling_error", (error) => {
   log(`[polling_error] ${error?.message || String(error)}`);
 });
 
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    void shutdown(signal);
+  });
+}
+
 (async () => {
   await ensureDownloadDir();
 
@@ -1781,4 +1805,8 @@ bot.on("polling_error", (error) => {
       "Put yt-dlp.exe there or set YTDLP_PATH in .env."
     );
   }
-})();
+})().catch((error) => {
+  const errorText = error?.stack || error?.message || String(error);
+  log(`[startup_error] ${errorText}`);
+  process.exit(1);
+});

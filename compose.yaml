@@ -1,0 +1,13 @@
+name: telegram-video-downloader-bot
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-video-downloader-bot
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+    restart: unless-stopped

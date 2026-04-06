@@ -8,6 +8,8 @@ services:
     dockerContext: .
     autoDeploy: true
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: BOT_TOKEN
         sync: false
       - key: MAX_DOWNLOAD_MB
